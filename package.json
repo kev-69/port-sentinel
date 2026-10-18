@@ -1,0 +1,29 @@
+{
+  "name": "port-sentinel",
+  "version": "1.0.0",
+  "description": "A CLI that finds open TCP ports on a host or CIDR range and identifies the service from its banner",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kev-69/port-sentinel.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/kev-69/port-sentinel/issues"
+  },
+  "homepage": "https://github.com/kev-69/port-sentinel#readme",
+  "dependencies": {
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
