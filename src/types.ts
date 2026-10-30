@@ -22,8 +22,10 @@ export interface TcpProbeResult {
   port: number;
   state: PortState;
   reason: Reason;
-  /** Time from connect() to the outcome, in milliseconds. */
+  /** Time from connect() to the outcome of the *last* attempt, in milliseconds. */
   latencyMs: number;
+  /** How many connect() attempts were made (1 + retries used). */
+  attempts: number;
   /** The raw errno code (e.g. ECONNREFUSED) when the outcome came from an error. */
   errorCode?: string;
 }
