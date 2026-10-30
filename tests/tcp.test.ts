@@ -1,6 +1,7 @@
 import net from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
-import { classifyError, probeTcp, scanHostSequential } from '../src/scanner/tcp.js';
+import { classifyError, probeTcp, probeTcpWithRetry, scanHost } from '../src/scanner/tcp.js';
+import type { TcpProbeResult } from '../src/types.js';
 
 const LOOPBACK = '127.0.0.1';
 // RFC 5737 TEST-NET-1: reserved for documentation, never routed. SYNs to it vanish,
@@ -87,14 +88,66 @@ describe('classifyError', () => {
   });
 });
 
-describe('scanHostSequential', () => {
-  it('returns one result per port, in the order given', async () => {
+describe('probeTcpWithRetry', () => {
+  it('does not retry definitive answers (open, closed)', async () => {
     const { port: open } = await listen();
     const closed = await closedPort();
-    const results = await scanHostSequential(LOOPBACK, [open, closed], { timeoutMs: 1000 });
-    expect(results.map((r) => [r.port, r.state])).toEqual([
-      [open, 'open'],
-      [closed, 'closed'],
-    ]);
+    let calls = 0;
+    const opts = { timeoutMs: 1000, retries: 3, beforeAttempt: async () => void calls++ };
+    expect(await probeTcpWithRetry(LOOPBACK, open, opts)).toMatchObject({ state: 'open', attempts: 1 });
+    expect(await probeTcpWithRetry(LOOPBACK, closed, opts)).toMatchObject({ state: 'closed', attempts: 1 });
+    expect(calls).toBe(2);
+  });
+
+  it('retries silence up to `retries` times, calling beforeAttempt each time', async () => {
+    let calls = 0;
+    const r = await probeTcpWithRetry(BLACKHOLE, 80, {
+      timeoutMs: 100,
+      retries: 2,
+      beforeAttempt: async () => void calls++,
+    });
+    expect(r.state).toBe('filtered');
+    if (r.reason === 'no-response') {
+      expect(r.attempts).toBe(3);
+      expect(calls).toBe(3);
+    } else {
+      // Offline machine: ENETUNREACH is an answer, so no retries.
+      expect(r.attempts).toBe(1);
+    }
+  });
+
+  it('makes exactly one attempt when retries is 0', async () => {
+    const r = await probeTcpWithRetry(BLACKHOLE, 80, { timeoutMs: 100, retries: 0 });
+    expect(r.attempts).toBe(1);
+  });
+});
+
+describe('scanHost', () => {
+  async function collect(gen: AsyncIterable<TcpProbeResult>): Promise<TcpProbeResult[]> {
+    const out: TcpProbeResult[] = [];
+    for await (const r of gen) out.push(r);
+    return out.sort((a, b) => a.port - b.port);
+  }
+
+  it('returns one result per port', async () => {
+    const { port: open } = await listen();
+    const closed = await closedPort();
+    const results = await collect(
+      scanHost(LOOPBACK, [open, closed], { timeoutMs: 1000, retries: 0, concurrency: 10 }),
+    );
+    const byPort = Object.fromEntries(results.map((r) => [r.port, r.state]));
+    expect(byPort).toEqual({ [open]: 'open', [closed]: 'closed' });
+  });
+
+  // The whole point of Stage 2: filtered ports wait in parallel, not one after another.
+  // Sequentially this would take 20 x 300 ms = 6 s.
+  it('overlaps timeouts: 20 filtered ports take about one timeout, not twenty', async () => {
+    const ports = Array.from({ length: 20 }, (_, i) => i + 1);
+    const start = performance.now();
+    const results = await collect(scanHost(BLACKHOLE, ports, { timeoutMs: 300, retries: 0, concurrency: 20 }));
+    const elapsed = performance.now() - start;
+    expect(results).toHaveLength(20);
+    expect(results.every((r) => r.state === 'filtered')).toBe(true);
+    expect(elapsed).toBeLessThan(1500);
   });
 });
