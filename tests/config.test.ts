@@ -48,18 +48,39 @@ describe('parsePorts', () => {
 });
 
 describe('scanOptionsSchema', () => {
+  // What commander hands us: every value is a string, and --rate is absent unless given.
+  const cli = { ports: '22,80', timeout: '500', concurrency: '500', retries: '1' };
+
   it('accepts CLI strings and converts them', () => {
-    const opts = scanOptionsSchema.parse({ ports: '22,80', timeout: '500' });
-    expect(opts).toEqual({ ports: [22, 80], timeout: 500, all: false });
+    expect(scanOptionsSchema.parse(cli)).toEqual({
+      ports: [22, 80],
+      timeout: 500,
+      concurrency: 500,
+      retries: 1,
+      all: false,
+    });
+    expect(scanOptionsSchema.parse({ ...cli, rate: '250' }).rate).toBe(250);
   });
 
   it('rejects a bad port spec with a readable message', () => {
-    const r = scanOptionsSchema.safeParse({ ports: '99999', timeout: '500' });
+    const r = scanOptionsSchema.safeParse({ ...cli, ports: '99999' });
     expect(r.success).toBe(false);
     expect(r.error?.issues[0]?.message).toMatch(/out of range/);
   });
 
   it.each(['0', '-5', 'abc', '1.5', '60001'])('rejects timeout %j', (timeout) => {
-    expect(scanOptionsSchema.safeParse({ ports: '80', timeout }).success).toBe(false);
+    expect(scanOptionsSchema.safeParse({ ...cli, timeout }).success).toBe(false);
+  });
+
+  it.each(['0', '-1', '2.5', '10001'])('rejects concurrency %j', (concurrency) => {
+    expect(scanOptionsSchema.safeParse({ ...cli, concurrency }).success).toBe(false);
+  });
+
+  it.each(['0', '-1', 'fast'])('rejects rate %j', (rate) => {
+    expect(scanOptionsSchema.safeParse({ ...cli, rate }).success).toBe(false);
+  });
+
+  it.each(['-1', '11', '0.5'])('rejects retries %j', (retries) => {
+    expect(scanOptionsSchema.safeParse({ ...cli, retries }).success).toBe(false);
   });
 });
