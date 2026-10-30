@@ -1,5 +1,6 @@
 import net from 'node:net';
 import type { PortState, Reason, TcpProbeResult } from '../types.js';
+import { pool } from './pool.js';
 
 export interface TcpProbeOptions {
   /** Wall-clock deadline for the handshake, in milliseconds. */
@@ -62,6 +63,7 @@ export function probeTcp(host: string, port: number, opts: TcpProbeOptions): Pro
         state,
         reason,
         latencyMs: Math.round((performance.now() - start) * 100) / 100,
+        attempts: 1,
       };
       if (errorCode !== undefined) result.errorCode = errorCode;
       resolve(result);
@@ -84,18 +86,46 @@ export function probeTcp(host: string, port: number, opts: TcpProbeOptions): Pro
   });
 }
 
+export interface RetryOptions extends TcpProbeOptions {
+  /** Extra attempts after a no-response timeout. 0 = never retry. */
+  retries: number;
+  /** Called before every attempt, including retries: each attempt sends a SYN. */
+  beforeAttempt?: () => Promise<void>;
+}
+
 /**
- * Probe ports one at a time. Deliberately naive: total time is the sum of every probe,
- * so filtered ports cost a full timeout each. Stage 2 replaces this with a pool.
+ * Probe with retries, but only when silence could be packet loss.
+ *
+ * SYN/ACK, RST and ICMP unreachable are answers; asking again would get the same answer.
+ * Silence is the one outcome that a single lost SYN or SYN/ACK can produce by accident.
  */
-export async function scanHostSequential(
+export async function probeTcpWithRetry(
   host: string,
-  ports: readonly number[],
-  opts: TcpProbeOptions,
-): Promise<TcpProbeResult[]> {
-  const results: TcpProbeResult[] = [];
-  for (const port of ports) {
-    results.push(await probeTcp(host, port, opts));
+  port: number,
+  opts: RetryOptions,
+): Promise<TcpProbeResult> {
+  for (let attempt = 1; ; attempt++) {
+    await opts.beforeAttempt?.();
+    const result = await probeTcp(host, port, opts);
+    const retryable = result.state === 'filtered' && result.reason === 'no-response';
+    if (!retryable || attempt > opts.retries) return { ...result, attempts: attempt };
   }
-  return results;
+}
+
+export interface ScanHostOptions extends RetryOptions {
+  concurrency: number;
+}
+
+/**
+ * Scan many ports on one host with bounded concurrency. Yields results as they complete,
+ * so callers can stream them (progress, output) instead of waiting for the whole scan.
+ *
+ * concurrency = 1 reproduces the Stage 1 sequential scan.
+ */
+export function scanHost(
+  host: string,
+  ports: Iterable<number>,
+  opts: ScanHostOptions,
+): AsyncGenerator<TcpProbeResult, void, undefined> {
+  return pool(ports, (port) => probeTcpWithRetry(host, port, opts), { concurrency: opts.concurrency });
 }
