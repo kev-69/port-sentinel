@@ -44,6 +44,10 @@ export const scanOptionsSchema = z.object({
     }
   }),
   timeout: z.coerce.number().int().min(1).max(60_000),
+  concurrency: z.coerce.number().int().min(1).max(10_000),
+  // Probes per second; omitted means unlimited (bounded only by concurrency).
+  rate: z.coerce.number().positive().max(1_000_000).optional(),
+  retries: z.coerce.number().int().min(0).max(10),
   all: z.boolean().default(false),
 });
 
