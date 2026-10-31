@@ -1,5 +1,5 @@
 import net from 'node:net';
-import type { PortState, Reason, TcpProbeResult } from '../types.js';
+import type { PortState, Reason, Target, TcpProbeResult } from '../types.js';
 import { pool } from './pool.js';
 
 export interface TcpProbeOptions {
@@ -127,5 +127,19 @@ export function scanHost(
   ports: Iterable<number>,
   opts: ScanHostOptions,
 ): AsyncGenerator<TcpProbeResult, void, undefined> {
-  return pool(ports, (port) => probeTcpWithRetry(host, port, opts), { concurrency: opts.concurrency });
+  const targets = (function* () {
+    for (const port of ports) yield { host, port };
+  })();
+  return scanTargets(targets, opts);
+}
+
+/**
+ * Scan an arbitrary stream of (host, port) targets with bounded concurrency.
+ * This is the general driver; `scanHost` is the single-host special case.
+ */
+export function scanTargets(
+  targets: Iterable<Target>,
+  opts: ScanHostOptions,
+): AsyncGenerator<TcpProbeResult, void, undefined> {
+  return pool(targets, (t) => probeTcpWithRetry(t.host, t.port, opts), { concurrency: opts.concurrency });
 }

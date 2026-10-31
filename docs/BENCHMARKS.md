@@ -55,3 +55,19 @@ so the slowest ~7% of probes cross 1000 ms and get misclassified.
   defender also sees.
 - Nmap avoids this with adaptive timing: it measures RTT and shrinks its in-flight window when responses go missing.
   This is a non-goal for now (see SPEC Stage 2).
+
+## Stage 3: lazy randomized target generation (2026-10-31)
+
+Plan for `10.0.0.0/8` × ports 1–1000 = **16,777,216,000** targets. Pulled the first 1,000,000
+through the Feistel shuffle:
+
+| metric | value |
+|---|---|
+| time for 1,000,000 targets | 158 ms (~6.3M/s) |
+| heap after 1,000,000 targets | 8.3 MB (flat) |
+| first 5 targets (seed 1) | 10.39.1.238:108, 10.42.170.20:39, 10.26.27.20:377, 10.2.209.79:115, 10.58.8.199:939 |
+
+The heap stays flat because nothing is materialized: the permutation is computed per index.
+The first five targets are five distinct hosts and five distinct ports — the interleaving that
+replaces a sequential sweep. A naive `[...hosts].flatMap(h => ports.map(...))` would try to build a
+16-billion-element array and crash long before the scan starts.

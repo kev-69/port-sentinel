@@ -17,6 +17,12 @@ export type Reason =
   | 'net-unreach'
   | 'local-error';
 
+/** One thing to probe: a host (as a string, v4 or v6) and a TCP port. */
+export interface Target {
+  host: string;
+  port: number;
+}
+
 export interface TcpProbeResult {
   host: string;
   port: number;

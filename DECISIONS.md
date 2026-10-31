@@ -50,3 +50,30 @@ One entry per trade-off: context, options considered, decision, consequences.
 ## 009: Default concurrency 500
 - **Evidence:** docs/BENCHMARKS.md. Filtered-heavy scans benefit almost linearly. Loopback tops out at about 8,000 sockets/s whatever the concurrency, and 5,000 caused false "filtered" results.
 - **Decision:** default 500, max 10,000 (the max lets you reproduce the failure on purpose).
+
+## 010: uint32 via multiply/`>>> 0`, not left shifts
+- **Context:** `ipToInt` must turn "255.255.255.255" into 4294967295, not -1.
+- **Decision:** accumulate octets with `acc * 256 + n`, then `>>> 0` once at the end. `intToIp` uses `>>> 8`/`& 0xff`, which already yield unsigned results.
+- **Why:** JS bitwise operators are signed-32-bit, so `a << 24` for `a >= 128` goes negative. `prefixMask` still uses `<<` but special-cases `/0` because a shift of 32 wraps to a shift of 0.
+
+## 011: Feistel permutation for randomized order (not Fisher-Yates, not LCG)
+- **Context:** need pseudo-random scan order over a space too big to store (a /8 × 1000 ports is 16.8 billion targets, confirmed in BENCHMARKS).
+- **Options:** Fisher–Yates (needs the whole array); an LCG with a full-period modulus (works, but low bits have short periods and mix poorly); a Feistel network (a stateless keyed bijection).
+- **Decision:** a 4-round balanced Feistel over `2^bits` (bits rounded up to even), with cycle-walking to restrict the image to `[0, n)`.
+- **Why Feistel is always a permutation:** every round is invertible for any round function, so the whole network is a bijection regardless of the hash quality; the hash only affects how well-mixed it looks.
+- **Consequences:** O(1) memory, O(1) per index, seedable (so Stage 6 can resume a scan in the same order). Measured: 1,000,000 targets from a /8 plan in 158 ms, heap flat at 8.3 MB.
+
+## 012: Cycle-walk the input over [0, n), not [0, domain)  [BUG FOUND]
+- **Context:** the first implementation looped the index over the full padded domain and cycle-walked each value. Tests hung.
+- **Cause:** a Feistel permutation can have cycles that live entirely in `[n, domain)`. Starting a cycle-walk from such a value never re-enters `[0, n)`, so the `while (p >= n)` loop never terminated.
+- **Fix:** iterate the input `i` over `[0, n)` only. Because `i` is in `[0, n)`, its permutation orbit is guaranteed to return there, so the walk always terminates. This is the standard cycle-walking construction.
+- **Lesson:** cycle-walking is a property of *where you start*, not just of the test condition.
+
+## 013: Flatten (host, port) to one index and shuffle that
+- **Decision:** index `i` decodes to `host = first + ⌊i/P⌋`, `port = ports[i % P]`; the single range `[0, hosts*P)` is shuffled as a unit.
+- **Why:** shuffling one combined space interleaves hosts and ports, so consecutive probes hit different hosts and different ports. Shuffling hosts and ports separately would still sweep one host's ports in a block.
+- **Consequences:** a single Feistel call drives the whole scan. Verified: the first 5 targets of a /8 plan were 5 distinct hosts and 5 distinct ports.
+
+## 014: --max-hosts blast-radius cap and a stderr authorization notice
+- **Decision:** CIDR scans refuse blocks larger than `--max-hosts` (default 4096) and always print "only scan networks you own or are authorized to test" to stderr.
+- **Why:** a CIDR scan touches many machines; an accidental `/8` is the kind of mistake that gets an engineer in real trouble. The cap and notice make scope and authorization explicit (THREAT_MODEL abuse case).

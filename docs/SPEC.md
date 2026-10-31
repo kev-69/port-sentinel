@@ -53,6 +53,25 @@ Write each stage's section before writing its code.
 
 ## Stage 3: CIDR parsing and randomized order
 
+**Goal:** expand an IPv4 CIDR block into addresses with bit math, combine them with the port list, and scan the whole space in a pseudo-random order using O(1) memory.
+
+- **IPv4 integer math** (`cidr.ts`)
+  - `ipToInt("a.b.c.d")`: validate 4 octets in 0..255, then `((a<<24)|(b<<16)|(c<<8)|d) >>> 0`. The `>>> 0` is the whole point: `a<<24` for `a>=128` is a *negative* signed-32-bit number in JS, and `>>> 0` reinterprets the bits as unsigned.
+  - `intToIp(n)`: the inverse, using `>>> 8` / `& 0xff`.
+  - `parseCidr("192.168.1.0/24")` → `{ network, prefix, size, first, last }`.
+    - mask for prefix `p`: `p===0 ? 0 : (0xFFFFFFFF << (32-p)) >>> 0`. Special-cased because JS shifts count mod 32, so `<<32` would be `<<0` (a classic trap).
+    - `network = ip & mask` (host bits dropped, so `192.168.1.5/24` normalises to `192.168.1.0`).
+    - `size = 2**(32-p)`, `first = network`, `last = network + size - 1`. Sizes and `last` are kept as plain doubles, not uint32, so `/0` (2^32) stays exact.
+  - Range `[first, last]` is scanned **in full**, including the network and broadcast addresses, matching Nmap's default. A live host can answer on either.
+- **Randomized order** (`shuffle.ts`): a Feistel permutation.
+  - We need a bijection on `[0, n)` that we can walk lazily, because `/8 × 1000 ports` is 16 billion targets — generable, never storable. Fisher–Yates is out (needs the array).
+  - Round the domain up to `2^bits` with even `bits`, split each index into equal halves, run 4 Feistel rounds with a seeded round function. A balanced Feistel is a bijection for *any* round function, so the output is always a permutation.
+  - **Cycle-walking:** when a permuted value is `>= n` (the domain is bigger than `n`), feed it back through until it lands in range. Since the domain is `< 2n`, the expected number of walks is `< 2`.
+  - Seeded, so a scan's order is reproducible (needed for resume in Stage 6).
+- **Scan plan** (`plan.ts`): one linear index `i in [0, hosts*ports)` decodes to `(host = first + ⌊i/P⌋, port = ports[i % P])`. Shuffling that single space interleaves hosts *and* ports, so consecutive probes jump across the block instead of walking one host's ports in order.
+- **CLI:** a `<target>` containing `/` is an IPv4 CIDR. `--seq` disables randomization; `--seed <n>` sets the permutation seed. `--max-hosts <n>` (default 4096) caps blast radius; a larger block is refused unless the cap is raised. The authorization reminder prints to stderr for every CIDR scan.
+- **Non-goals:** IPv6 CIDR (would need BigInt), hostname lists, excluding network/broadcast.
+
 ## Stage 4: Banner grabbing and signatures
 
 ## Stage 5: UDP probes (DNS, NTP)

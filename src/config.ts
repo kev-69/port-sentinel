@@ -49,6 +49,10 @@ export const scanOptionsSchema = z.object({
   rate: z.coerce.number().positive().max(1_000_000).optional(),
   retries: z.coerce.number().int().min(0).max(10),
   all: z.boolean().default(false),
+  // CIDR scans only:
+  seq: z.boolean().default(false), // scan in ascending order instead of shuffled
+  seed: z.coerce.number().int().optional(), // permutation seed (reproducible order)
+  maxHosts: z.coerce.number().int().min(1).max(16_777_216).default(4096), // blast-radius cap
 });
 
 export type ScanOptions = z.infer<typeof scanOptionsSchema>;

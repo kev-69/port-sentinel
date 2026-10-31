@@ -58,6 +58,8 @@ describe('scanOptionsSchema', () => {
       concurrency: 500,
       retries: 1,
       all: false,
+      seq: false,
+      maxHosts: 4096,
     });
     expect(scanOptionsSchema.parse({ ...cli, rate: '250' }).rate).toBe(250);
   });
