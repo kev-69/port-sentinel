@@ -102,3 +102,22 @@ One entry per trade-off: context, options considered, decision, consequences.
 - **Context:** after reading a banner we could send FIN (`end()`) or RST (`destroy()`).
 - **Decision:** `destroy()`, matching `probeTcp` and Nmap.
 - **Detection note (project 7):** an abrupt RST after a bare banner read is itself a scan signal, and some servers log the reset as an error. A graceful `end()` would look more like a normal client. Left as a future stealth option.
+
+## 020: `open|filtered` is a real state, not a cop-out
+- **Context:** UDP has no handshake, so silence is ambiguous.
+- **Decision:** add `open|filtered` to `PortState`. Silence reports it; a validated reply reports `open`; ICMP port-unreachable reports `closed`.
+- **Why:** reporting silence as plain `filtered` (like TCP) would be a lie — the service may be open and simply ignoring a datagram it didn't understand. Nmap uses this exact combined state. Adding it forced the two `Record<PortState, number>` counters to handle it, which is correct.
+
+## 021: Protocol-specific payloads with reply validation
+- **Decision:** DNS (root-NS query) and NTP (client mode 3) payloads, each paired with a validator. A reply counts as `open` with a named service only if it is a well-formed answer *to our probe*: DNS must echo our 16-bit ID and set QR; NTP must be mode 4 and echo our transmit timestamp in the origin field.
+- **Why:** an empty/garbage datagram to an open UDP service is usually dropped silently, so the payload must be a real request. Validating the echo/ID stops a stray or spoofed datagram from being mistaken for a match. Any reply at all still marks the port `open` (something is there); validation only decides whether we can name it.
+- **Non-53/123 ports** get an empty datagram and almost always read `open|filtered`. That is honest.
+
+## 022: connect() the UDP socket before sending
+- **Decision:** `socket.connect(port, host)` then `send()`.
+- **Why:** on Linux, ICMP errors (port-unreachable → `ECONNREFUSED`) are only delivered to a *connected* UDP socket, which is how we detect `closed`. Connecting also makes the kernel drop datagrams from any other source, so we only accept replies from the probed peer.
+
+## 023: Windows cannot detect closed UDP ports  [platform limit]
+- **Finding (measured 2026-11-05):** a datagram to a closed loopback UDP port produced silence on Windows, connected or not — never `ECONNREFUSED`.
+- **Cause:** libuv's `src/win/udp.c` ignores `WSAECONNRESET`/`WSAENETRESET` on receive ("a previous sendto operation failed; ignore this error") and never sets `SIO_UDP_CONNRESET`. Go, .NET and tokio toggle that ioctl; libuv does not, so the ICMP port-unreachable never reaches JavaScript.
+- **Consequence:** on Windows, every closed UDP port reads `open|filtered`; only Linux reports `closed`. Tests accept either. Documented in SPEC Stage 5 and the UDP test. (Working around it would need a raw socket — the Stage 7 theme.)

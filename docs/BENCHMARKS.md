@@ -71,3 +71,21 @@ The heap stays flat because nothing is materialized: the permutation is computed
 The first five targets are five distinct hosts and five distinct ports — the interleaving that
 replaces a sequential sweep. A naive `[...hosts].flatMap(h => ports.map(...))` would try to build a
 16-billion-element array and crash long before the scan starts.
+
+## Stage 5: UDP probes (2026-11-05)
+
+Live probes from this machine (Windows 11, Node 22.14.0):
+
+| target | probe | result | latency |
+|---|---|---|---|
+| 1.1.1.1:53 | DNS root-NS query | open, `rcode=NOERROR answers=13` | ~20 ms |
+| time.cloudflare.com:123 (162.159.200.123) | NTP client mode 3 | open, `stratum=3 version=4` | ~590 ms |
+| 127.0.0.1:9,53,123 (closed) | empty/DNS/NTP | all `open\|filtered` | 800 ms each (one timeout) |
+
+Observations:
+- Validation works end to end: the DNS reply carried 13 answers (the 13 root-server NS records), and
+  the NTP reply echoed our transmit timestamp, so both are genuine `open`, not just "bytes came back".
+- Closed UDP ports cost a full timeout each (no fast RST equivalent reaches us on Windows — DECISIONS 023),
+  which is the structural reason UDP scans are slow. On Linux the ICMP port-unreachable would return `closed`
+  quickly, but Linux rate-limits those to ~1/s, so a wide closed-port UDP scan is slow *there* too, just for a
+  different reason. Either way: UDP scanning is inherently slow, and `--retries` makes it slower but more reliable.

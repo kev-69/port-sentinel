@@ -93,6 +93,29 @@ Write each stage's section before writing its code.
 
 ## Stage 5: UDP probes (DNS, NTP)
 
+**Goal:** probe UDP ports with protocol-correct payloads, because UDP has no handshake. A service answers only if the datagram is something it understands.
+
+- **Why payloads matter.** TCP tells you a port is open at the transport layer (SYN/ACK). UDP has nothing like that: an empty or wrong datagram is usually dropped in silence by an *open* service. So the probe has to be a real request for that protocol.
+- **Port states** (Nmap's UDP model):
+
+  | Observation | state | reason |
+  |---|---|---|
+  | a reply that our parser validates | open | udp-response |
+  | a reply that does not validate | open | udp-response (service unknown) |
+  | `ECONNREFUSED` (ICMP port unreachable) | closed | port-unreach |
+  | `EHOSTUNREACH` / `ENETUNREACH` | filtered | host-unreach / net-unreach |
+  | silence until the deadline | **open\|filtered** | no-response |
+
+  Silence is the inverse of TCP. In TCP it means *filtered*. In UDP it can equally mean "open but ignored our datagram" or "firewall dropped it", so we report both.
+- **Connected sockets.** We call `socket.connect(port, host)` before sending. On Linux, ICMP errors are only delivered to a *connected* UDP socket. Connecting also makes the kernel drop datagrams from any other source.
+- **Platform limit (measured 2026-11-05):** on Windows, a datagram to a closed loopback port produced silence, connected or not. libuv's `src/win/udp.c` ignores `WSAECONNRESET`/`WSAENETRESET` on receive ("a previous sendto operation failed; ignore this error"), so the ICMP port-unreachable never reaches JavaScript. **On Windows every closed UDP port reports `open|filtered`.** Linux reports `closed`.
+- **DNS probe** (RFC 1035 §4.1): a 12-byte header (random 16-bit ID, flags `0x0100` = RD, QDCOUNT=1) plus one question: root name `.`, QTYPE=NS(2), QCLASS=IN(1). Asking for the root's name servers is a valid query every resolver and authoritative server can answer (or refuse) without us looking up a real name. A reply is accepted only if it is ≥12 bytes, the ID matches, and QR=1. We report RCODE and the answer count.
+- **NTP probe** (RFC 5905 §7.3): 48 bytes. First byte `0x23` = LI 0, VN 4, Mode 3 (client). A random transmit timestamp goes in bytes 40–47. A reply is accepted only if it is ≥48 bytes, Mode=4 (server), and its *origin* timestamp (bytes 24–31) equals our transmit timestamp. The server echoes it back, which proves the reply answers *our* request. We report stratum and version.
+- **Other ports:** an empty datagram. Most services ignore it, so expect `open|filtered`. That is honest, not a bug.
+- **Retries:** silence is retried (default 1). Losing a datagram is normal for UDP, and Linux rate-limits ICMP port-unreachable to about 1/s by default (`net.ipv4.icmp_ratelimit`). That limit is why Nmap UDP scans are slow.
+- **CLI:** `scan --udp` switches the transport for host and CIDR targets. Port 53 gets the DNS probe, 123 the NTP probe, the rest an empty datagram.
+- **Non-goals:** SNMP/other probes, IPv6 DNS servers' `udp6` edge cases beyond choosing the socket family, raw ICMP reading (needs raw sockets, see Stage 7).
+
 ## Stage 6: Output formats, progress, resume, diff
 
 ## Stage 7: Study: why Nmap SYN scans need raw sockets
