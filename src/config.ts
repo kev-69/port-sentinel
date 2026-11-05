@@ -50,6 +50,7 @@ export const scanOptionsSchema = z.object({
   retries: z.coerce.number().int().min(0).max(10),
   all: z.boolean().default(false),
   banner: z.boolean().default(false), // fingerprint open ports after the scan
+  udp: z.boolean().default(false), // scan UDP instead of TCP
   // CIDR scans only:
   seq: z.boolean().default(false), // scan in ascending order instead of shuffled
   seed: z.coerce.number().int().optional(), // permutation seed (reproducible order)

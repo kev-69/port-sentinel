@@ -6,10 +6,11 @@ import { fingerprint, printableBanner, type FingerprintResult } from './fingerpr
 import { pool } from './scanner/pool.js';
 import { RateLimiter } from './scanner/rate-limiter.js';
 import { scanHost, scanTargets, type ScanHostOptions } from './scanner/tcp.js';
+import { scanUdpHost, scanUdpTargets, type ScanUdpOptions } from './scanner/udp.js';
 import { parseCidr } from './targets/cidr.js';
 import { resolveHost } from './targets/host.js';
 import { planCidrScan, type ScanPlanOptions } from './targets/plan.js';
-import type { PortState, Target, TcpProbeResult } from './types.js';
+import type { PortState, Target, TcpProbeResult, UdpProbeResult } from './types.js';
 
 const program = new Command()
   .name('port-sentinel')
@@ -24,8 +25,9 @@ program
   .option('-c, --concurrency <n>', 'max probes in flight', '500')
   .option('-r, --rate <pps>', 'max connection attempts per second (default: unlimited)')
   .option('--retries <n>', 'extra attempts for ports that did not answer', '1')
-  .option('-a, --all', 'also list closed and filtered ports')
-  .option('--banner', 'fingerprint open ports (service + version) after the scan')
+  .option('-a, --all', 'also list non-open ports')
+  .option('--udp', 'scan UDP instead of TCP (53=DNS, 123=NTP, else empty datagram)')
+  .option('--banner', 'fingerprint open TCP ports (service + version) after the scan')
   .option('--seq', 'scan a CIDR in ascending order instead of randomized')
   .option('--seed <n>', 'seed for randomized CIDR order (reproducible)')
   .option('--max-hosts <n>', 'refuse a CIDR block larger than this', '4096')
@@ -49,7 +51,9 @@ program
       scanOpts.beforeAttempt = () => limiter.take();
     }
 
-    if (target.includes('/')) {
+    if (opts.udp) {
+      await runUdpScan(target, opts, scanOpts);
+    } else if (target.includes('/')) {
       await runCidrScan(target, opts, scanOpts);
     } else {
       await runHostScan(target, opts, scanOpts);
@@ -71,6 +75,57 @@ async function runHostScan(target: string, opts: Opts, scanOpts: ScanHostOptions
   printSummary(results, elapsed);
 
   if (opts.banner) await runBannerPhase(results, opts.concurrency);
+}
+
+/**
+ * UDP scan of a host or CIDR. Shares the plan/pool machinery but prints UDP-specific
+ * columns (probe + parsed service info) and never runs the TCP banner phase.
+ */
+async function runUdpScan(target: string, opts: Opts, scanOpts: ScanHostOptions): Promise<void> {
+  const udpOpts: ScanUdpOptions = {
+    timeoutMs: scanOpts.timeoutMs,
+    concurrency: scanOpts.concurrency,
+    retries: scanOpts.retries,
+  };
+  if (scanOpts.beforeAttempt) udpOpts.beforeAttempt = scanOpts.beforeAttempt;
+
+  const started = performance.now();
+  const results: UdpProbeResult[] = [];
+
+  if (target.includes('/')) {
+    const cidr = parseCidr(target);
+    if (cidr.size > opts.maxHosts) {
+      console.error(`refusing to scan ${cidr.size} hosts (${target}); raise --max-hosts to proceed.`);
+      process.exitCode = 2;
+      return;
+    }
+    console.error(`UDP scanning ${cidr.size} hosts. Only scan networks you own or are authorized to test.`);
+    const planOpts: ScanPlanOptions = { randomize: !opts.seq };
+    if (opts.seed !== undefined) planOpts.seed = opts.seed;
+    const plan = planCidrScan(target, opts.ports, planOpts);
+    for await (const r of scanUdpTargets(plan.targets(), udpOpts)) results.push(r);
+    console.log(`port-sentinel UDP scan of ${target}`);
+  } else {
+    const ip = await resolveHost(target);
+    for await (const r of scanUdpHost(ip, opts.ports, udpOpts)) results.push(r);
+    console.log(`port-sentinel UDP scan of ${target}${ip !== target ? ` (${ip})` : ''}`);
+  }
+  const elapsed = ((performance.now() - started) / 1000).toFixed(2);
+
+  results.sort((a, b) => (a.host === b.host ? a.port - b.port : ipCompare(a.host, b.host)));
+  console.log('PORT      STATE          PROBE  SERVICE  INFO');
+  let open = 0;
+  for (const r of results) {
+    if (r.state === 'open') open++;
+    // "open|filtered" is the common, mostly-uninteresting case; hide it unless --all.
+    if (!opts.all && r.state !== 'open' && r.state !== 'closed') continue;
+    const host = results.some((x) => x.host !== r.host) ? `${r.host} ` : '';
+    console.log(
+      `${host}${`${r.port}/udp`.padEnd(10)}${r.state.padEnd(15)}${r.probe.padEnd(7)}` +
+        `${(r.service ?? '-').padEnd(9)}${r.info ?? ''}`,
+    );
+  }
+  console.log(`\n${results.length} ports in ${elapsed}s: ${open} open (replied)`);
 }
 
 /**

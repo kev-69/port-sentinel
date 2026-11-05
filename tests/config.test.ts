@@ -59,6 +59,7 @@ describe('scanOptionsSchema', () => {
       retries: 1,
       all: false,
       banner: false,
+      udp: false,
       seq: false,
       maxHosts: 4096,
     });
