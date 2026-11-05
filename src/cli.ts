@@ -2,12 +2,14 @@
 import { Command } from 'commander';
 import { z } from 'zod';
 import { scanOptionsSchema } from './config.js';
+import { fingerprint, printableBanner, type FingerprintResult } from './fingerprint/banner.js';
+import { pool } from './scanner/pool.js';
 import { RateLimiter } from './scanner/rate-limiter.js';
 import { scanHost, scanTargets, type ScanHostOptions } from './scanner/tcp.js';
 import { parseCidr } from './targets/cidr.js';
 import { resolveHost } from './targets/host.js';
 import { planCidrScan, type ScanPlanOptions } from './targets/plan.js';
-import type { PortState, TcpProbeResult } from './types.js';
+import type { PortState, Target, TcpProbeResult } from './types.js';
 
 const program = new Command()
   .name('port-sentinel')
@@ -23,6 +25,7 @@ program
   .option('-r, --rate <pps>', 'max connection attempts per second (default: unlimited)')
   .option('--retries <n>', 'extra attempts for ports that did not answer', '1')
   .option('-a, --all', 'also list closed and filtered ports')
+  .option('--banner', 'fingerprint open ports (service + version) after the scan')
   .option('--seq', 'scan a CIDR in ascending order instead of randomized')
   .option('--seed <n>', 'seed for randomized CIDR order (reproducible)')
   .option('--max-hosts <n>', 'refuse a CIDR block larger than this', '4096')
@@ -66,6 +69,32 @@ async function runHostScan(target: string, opts: Opts, scanOpts: ScanHostOptions
   console.log(`port-sentinel scan of ${target}${ip !== target ? ` (${ip})` : ''}`);
   printPortTable(results, opts.all);
   printSummary(results, elapsed);
+
+  if (opts.banner) await runBannerPhase(results, opts.concurrency);
+}
+
+/**
+ * Second phase: fingerprint every open port with bounded concurrency.
+ * Runs after the scan so port discovery stays independent of version detection.
+ */
+async function runBannerPhase(results: readonly TcpProbeResult[], concurrency: number): Promise<void> {
+  const open: Target[] = results.filter((r) => r.state === 'open').map((r) => ({ host: r.host, port: r.port }));
+  if (open.length === 0) return;
+
+  console.log('\nSERVICE DETECTION');
+  const found: FingerprintResult[] = [];
+  for await (const fp of pool(open, (t) => fingerprint(t.host, t.port), { concurrency: Math.min(concurrency, 50) })) {
+    found.push(fp);
+  }
+  found.sort((a, b) => (a.host === b.host ? a.port - b.port : ipCompare(a.host, b.host)));
+  for (const fp of found) {
+    const svc = fp.match
+      ? `${fp.match.service}${fp.match.soft ? '?' : ''}` +
+        [fp.match.product, fp.match.version, fp.match.info].filter(Boolean).map((x) => ` ${x}`).join('')
+      : 'unknown';
+    const banner = fp.banner.length ? `  "${printableBanner(fp.banner, 80)}"` : '';
+    console.log(`${`${fp.host}:${fp.port}`.padEnd(22)}${svc}${banner}`);
+  }
 }
 
 async function runCidrScan(target: string, opts: Opts, scanOpts: ScanHostOptions): Promise<void> {
@@ -110,6 +139,10 @@ async function runCidrScan(target: string, opts: Opts, scanOpts: ScanHostOptions
     `\n${plan.total} probes across ${plan.hostCount} hosts in ${elapsed}s: ${open} open ports found` +
       (byHost.size ? ` on ${byHost.size} host(s)` : ''),
   );
+
+  if (opts.banner) {
+    await runBannerPhase([...byHost.values()].flat(), opts.concurrency);
+  }
 }
 
 function printPortTable(results: readonly TcpProbeResult[], all: boolean | undefined): void {

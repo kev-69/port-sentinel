@@ -77,3 +77,28 @@ One entry per trade-off: context, options considered, decision, consequences.
 ## 014: --max-hosts blast-radius cap and a stderr authorization notice
 - **Decision:** CIDR scans refuse blocks larger than `--max-hosts` (default 4096) and always print "only scan networks you own or are authorized to test" to stderr.
 - **Why:** a CIDR scan touches many machines; an accidental `/8` is the kind of mistake that gets an engineer in real trouble. The cap and notice make scope and authorization explicit (THREAT_MODEL abuse case).
+
+## 015: Fingerprinting is a separate phase with its own connection
+- **Context:** we could grab a banner on the same socket that found the port open.
+- **Decision:** run fingerprinting *after* the scan, opening a fresh connection per open port, mirroring Nmap's `-sV`.
+- **Why:** keeps `probeTcp` a pure port-state classifier (easy to reason about and test), and version detection is opt-in via `--banner`. There are far fewer open ports than scanned ports, so the extra connection is cheap.
+- **Trade-off:** a service that only shows its banner once per connection is re-greeted; acceptable.
+
+## 016: Data-driven signatures (regexes in JSON, validated by zod)
+- **Decision:** signatures live in `signature.json`: probes (NULL + send-probes) each with regex `matches` and `$1..$9` version templates. `compileSignatures` validates with zod and compiles each `RegExp` once.
+- **Why:** the brief requires data-driven, not hard-coded. New services are a JSON edit, not a code change. Compiling once avoids rebuilding regexes per probe.
+- **latin1 decode:** responses are matched as latin1 so binary protocols (MySQL's length-prefixed greeting) survive and `\x00` in a pattern is a literal NUL.
+
+## 017: NULL probe first, then port-scoped send-probes; hard match wins
+- **Decision:** always try the NULL probe (listen only); then send-probes whose `ports` include this port. Scan every rule and return the first *hard* match, falling back to a retained *softmatch*.
+- **Why:** many services greet on connect (SSH/FTP/SMTP); HTTP and Redis only answer when prompted, and scoping send-probes by port avoids sending an HTTP GET to a mail server. Softmatch names the service while leaving room for a version match (Nmap's model).
+
+## 018: ReDoS surface of a signature file
+- **Context:** regexes are data; a catastrophic-backtracking pattern could hang the scanner (ReDoS), and a signature file could one day be third-party.
+- **Mitigations:** match only against a bounded buffer (`maxBytes`, default 4096); a test asserts every bundled pattern is anchored with `^`; zod rejects unknown regex flags.
+- **Known gap:** we don't yet run regexes under a timeout (Node has no built-in per-regex timeout). Noted in THREAT_MODEL; a worker-thread timeout is a future option.
+
+## 019: Close banner connections with destroy() (RST), like the port probe
+- **Context:** after reading a banner we could send FIN (`end()`) or RST (`destroy()`).
+- **Decision:** `destroy()`, matching `probeTcp` and Nmap.
+- **Detection note (project 7):** an abrupt RST after a bare banner read is itself a scan signal, and some servers log the reset as an error. A graceful `end()` would look more like a normal client. Left as a future stealth option.

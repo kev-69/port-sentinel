@@ -1,0 +1,70 @@
+{
+  "probes": [
+    {
+      "name": "NULL",
+      "payload": "",
+      "rarity": 1,
+      "matches": [
+        {
+          "service": "ssh",
+          "pattern": "^SSH-(\\d+\\.\\d+)-([^\\r\\n]+)",
+          "version": "$2",
+          "info": "protocol $1"
+        },
+        {
+          "service": "ftp",
+          "pattern": "^220[- ].*(FTP|FileZilla|vsFTPd|ProFTPD)",
+          "soft": true,
+          "info": "$1"
+        },
+        {
+          "service": "smtp",
+          "pattern": "^220[- ]([^\\r\\n]*\\b(?:SMTP|ESMTP|Postfix|Exim|Sendmail)\\b[^\\r\\n]*)",
+          "info": "$1"
+        },
+        {
+          "service": "pop3",
+          "pattern": "^\\+OK[^\\r\\n]*(POP3|Dovecot)",
+          "info": "$1"
+        },
+        {
+          "service": "mysql",
+          "pattern": "^.\\x00\\x00\\x00\\x0a([0-9]+\\.[0-9]+\\.[0-9]+[^\\x00]*)\\x00",
+          "version": "$1"
+        }
+      ]
+    },
+    {
+      "name": "GetRequest",
+      "payload": "GET / HTTP/1.0\r\n\r\n",
+      "ports": [80, 591, 8000, 8008, 8080, 8888],
+      "rarity": 1,
+      "matches": [
+        {
+          "service": "http",
+          "pattern": "^HTTP/\\d\\.\\d \\d{3}[^\\r\\n]*\\r\\n(?:[^\\r\\n]+\\r\\n)*?Server: ([^\\r\\n]+)",
+          "flags": "s",
+          "product": "$1"
+        },
+        {
+          "service": "http",
+          "pattern": "^HTTP/\\d\\.\\d \\d{3}",
+          "soft": true
+        }
+      ]
+    },
+    {
+      "name": "RedisPing",
+      "payload": "*1\r\n$4\r\nPING\r\n",
+      "ports": [6379],
+      "rarity": 5,
+      "matches": [
+        {
+          "service": "redis",
+          "pattern": "^\\+PONG\\r\\n",
+          "soft": true
+        }
+      ]
+    }
+  ]
+}

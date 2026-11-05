@@ -58,6 +58,7 @@ describe('scanOptionsSchema', () => {
       concurrency: 500,
       retries: 1,
       all: false,
+      banner: false,
       seq: false,
       maxHosts: 4096,
     });

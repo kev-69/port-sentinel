@@ -74,6 +74,23 @@ Write each stage's section before writing its code.
 
 ## Stage 4: Banner grabbing and signatures
 
+**Goal:** for an open TCP port, read what the service says and identify it with a *data-driven* signature file (regexes live in JSON, never in code), mirroring a small slice of Nmap's `nmap-service-probes`.
+
+- **Why a separate phase.** Fingerprinting runs *after* the port scan, opening a fresh connection to each open port. This matches Nmap's `-sV` architecture and keeps `probeTcp` a pure port-state classifier. Trade-off: one extra connection per open port (acceptable — there are far fewer open ports than scanned ports).
+- **Two kinds of probe** (the key idea from Nmap Chapter 7):
+  - **NULL probe:** connect and *just listen*. Many services greet first — SSH, FTP, SMTP, POP3. Send nothing, read the banner.
+  - **Send probes:** connect and send a payload, then read. HTTP says nothing until you send a request; Redis answers `PING` with `+PONG`. Each send-probe may list `ports` it applies to, so we don't send an HTTP GET to a mail server.
+- **Signature file** ([signature.json](../src/fingerprint/signature.json)): `{ probes: [{ name, payload, ports?, rarity?, matches: [{ service, pattern, flags?, soft?, product?, version?, info? }] }] }`.
+  - `payload` is a literal string (JSON escapes `\r\n`); empty means the NULL probe.
+  - `pattern` is a JS regex *source* string, matched against the response decoded as latin1 (one byte ↔ one char, lossless for binary).
+  - `product`/`version`/`info` are templates with `$1`..`$9` capture-group references, the equivalent of Nmap's `p/ v/ i/` fields.
+  - `soft: true` is a *softmatch*: it names the service but lets later probes refine the version. A hard match stops probing.
+- **Matching** (`matcher.ts`): pure and socket-free, so it unit-tests against captured banners. `compileSignatures` validates the file with zod and compiles each regex once; `matchResponse(sig, probeName, bytes)` returns the first hard match, else a retained softmatch, else null.
+- **Grabbing** (`banner.ts`): `grabRaw` connects, optionally writes a payload, reads up to `maxBytes` (default 4096) until `bannerTimeoutMs` of quiet or FIN. Same settle-once / always-destroy discipline as `probeTcp`.
+- **CLI:** `--banner` runs the fingerprint phase on open ports and prints `service`, `product/version`, and a printable, truncated banner.
+- **Safety:** regexes come from a bundled file we control, but a bad pattern can catastrophically backtrack (ReDoS). Mitigations: match against a bounded buffer (≤ maxBytes), keep patterns anchored, and a test asserts every default pattern is anchored. (THREAT_MODEL: untrusted-signature risk.)
+- **Non-goals:** TLS/HTTPS (would need a TLS handshake), Nmap's full match-intensity/rarity engine, SSL probe fallback.
+
 ## Stage 5: UDP probes (DNS, NTP)
 
 ## Stage 6: Output formats, progress, resume, diff
