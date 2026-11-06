@@ -1,29 +1,44 @@
 #!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { Command } from 'commander';
 import { z } from 'zod';
 import { scanOptionsSchema } from './config.js';
-import { fingerprint, printableBanner, type FingerprintResult } from './fingerprint/banner.js';
+import { fingerprint } from './fingerprint/banner.js';
+import { diffReports, type ReportDiff } from './output/diff.js';
+import { toGrep } from './output/grep.js';
+import { parseReport, toJson } from './output/json.js';
+import { Progress } from './output/progress.js';
+import { buildReport, tcpRecord, udpRecord, type ScanReport, type ScanResultRecord } from './output/report.js';
+import {
+  CheckpointWriter,
+  doneSet,
+  loadCheckpoint,
+  planMatches,
+  type PlanIdentity,
+} from './persistence/checkpoint.js';
 import { pool } from './scanner/pool.js';
 import { RateLimiter } from './scanner/rate-limiter.js';
-import { scanHost, scanTargets, type ScanHostOptions } from './scanner/tcp.js';
-import { scanUdpHost, scanUdpTargets, type ScanUdpOptions } from './scanner/udp.js';
+import { scanTargets, type ScanHostOptions } from './scanner/tcp.js';
+import { scanUdpTargets, type ScanUdpOptions } from './scanner/udp.js';
 import { parseCidr } from './targets/cidr.js';
 import { resolveHost } from './targets/host.js';
 import { planCidrScan, type ScanPlanOptions } from './targets/plan.js';
-import type { PortState, Target, TcpProbeResult, UdpProbeResult } from './types.js';
+import type { Protocol, Target, TcpProbeResult } from './types.js';
+
+type Opts = z.infer<typeof scanOptionsSchema>;
 
 const program = new Command()
   .name('port-sentinel')
-  .description('TCP port scanner and service fingerprinter. Only scan hosts you own or are authorized to test.');
+  .description('TCP/UDP port scanner and service fingerprinter. Only scan hosts you own or are authorized to test.');
 
 program
   .command('scan')
-  .description('TCP connect scan of a host or IPv4 CIDR block')
+  .description('Scan a host or IPv4 CIDR block')
   .argument('<target>', 'IP address, hostname, or IPv4 CIDR (e.g. 192.168.1.0/24)')
   .option('-p, --ports <spec>', 'ports, e.g. 22,80,8000-8100', '1-1024')
-  .option('-t, --timeout <ms>', 'per-attempt connect deadline in ms', '1000')
+  .option('-t, --timeout <ms>', 'per-attempt deadline in ms', '1000')
   .option('-c, --concurrency <n>', 'max probes in flight', '500')
-  .option('-r, --rate <pps>', 'max connection attempts per second (default: unlimited)')
+  .option('-r, --rate <pps>', 'max attempts per second (default: unlimited)')
   .option('--retries <n>', 'extra attempts for ports that did not answer', '1')
   .option('-a, --all', 'also list non-open ports')
   .option('--udp', 'scan UDP instead of TCP (53=DNS, 123=NTP, else empty datagram)')
@@ -31,6 +46,11 @@ program
   .option('--seq', 'scan a CIDR in ascending order instead of randomized')
   .option('--seed <n>', 'seed for randomized CIDR order (reproducible)')
   .option('--max-hosts <n>', 'refuse a CIDR block larger than this', '4096')
+  .option('-o, --output <fmt>', 'output format: text, json, grep', 'text')
+  .option('--out-file <path>', 'write the report to a file instead of stdout')
+  .option('--progress', 'show a progress meter on stderr even when not a TTY')
+  .option('--checkpoint <path>', 'periodically save scan progress to this file')
+  .option('--resume <path>', 'resume from a checkpoint, skipping completed targets')
   .action(async (target: string, rawOpts: unknown) => {
     const parsed = scanOptionsSchema.safeParse(rawOpts);
     if (!parsed.success) {
@@ -38,201 +58,243 @@ program
       process.exitCode = 2;
       return;
     }
-    const opts = parsed.data;
-
-    const scanOpts: ScanHostOptions = {
-      timeoutMs: opts.timeout,
-      concurrency: opts.concurrency,
-      retries: opts.retries,
-    };
-    if (opts.rate !== undefined) {
-      // Burst of up to 1/10 s worth of probes smooths out timer jitter without a visible spike.
-      const limiter = new RateLimiter({ ratePerSec: opts.rate, burst: Math.max(1, Math.ceil(opts.rate / 10)) });
-      scanOpts.beforeAttempt = () => limiter.take();
-    }
-
-    if (opts.udp) {
-      await runUdpScan(target, opts, scanOpts);
-    } else if (target.includes('/')) {
-      await runCidrScan(target, opts, scanOpts);
-    } else {
-      await runHostScan(target, opts, scanOpts);
-    }
+    await runScan(target, parsed.data);
   });
 
-type Opts = z.infer<typeof scanOptionsSchema>;
-
-async function runHostScan(target: string, opts: Opts, scanOpts: ScanHostOptions): Promise<void> {
-  const ip = await resolveHost(target);
-  const started = performance.now();
-  const results: TcpProbeResult[] = [];
-  for await (const r of scanHost(ip, opts.ports, scanOpts)) results.push(r);
-  const elapsed = ((performance.now() - started) / 1000).toFixed(2);
-
-  results.sort((a, b) => a.port - b.port);
-  console.log(`port-sentinel scan of ${target}${ip !== target ? ` (${ip})` : ''}`);
-  printPortTable(results, opts.all);
-  printSummary(results, elapsed);
-
-  if (opts.banner) await runBannerPhase(results, opts.concurrency);
-}
-
-/**
- * UDP scan of a host or CIDR. Shares the plan/pool machinery but prints UDP-specific
- * columns (probe + parsed service info) and never runs the TCP banner phase.
- */
-async function runUdpScan(target: string, opts: Opts, scanOpts: ScanHostOptions): Promise<void> {
-  const udpOpts: ScanUdpOptions = {
-    timeoutMs: scanOpts.timeoutMs,
-    concurrency: scanOpts.concurrency,
-    retries: scanOpts.retries,
-  };
-  if (scanOpts.beforeAttempt) udpOpts.beforeAttempt = scanOpts.beforeAttempt;
-
-  const started = performance.now();
-  const results: UdpProbeResult[] = [];
-
-  if (target.includes('/')) {
-    const cidr = parseCidr(target);
-    if (cidr.size > opts.maxHosts) {
-      console.error(`refusing to scan ${cidr.size} hosts (${target}); raise --max-hosts to proceed.`);
+program
+  .command('diff')
+  .description('Compare two JSON scan reports (exit 1 if anything changed)')
+  .argument('<before>', 'path to the earlier report (JSON)')
+  .argument('<after>', 'path to the later report (JSON)')
+  .action((beforePath: string, afterPath: string) => {
+    let before: ScanReport;
+    let after: ScanReport;
+    try {
+      before = parseReport(readFileSync(beforePath, 'utf8'));
+      after = parseReport(readFileSync(afterPath, 'utf8'));
+    } catch (e) {
+      console.error(`could not read reports: ${(e as Error).message}`);
       process.exitCode = 2;
       return;
     }
-    console.error(`UDP scanning ${cidr.size} hosts. Only scan networks you own or are authorized to test.`);
+    const d = diffReports(before, after);
+    printDiff(d);
+    process.exitCode = d.hasChanges ? 1 : 0;
+  });
+
+await program.parseAsync();
+
+// --- scan pipeline -------------------------------------------------------------
+
+async function runScan(target: string, opts: Opts): Promise<void> {
+  const protocol: Protocol = opts.udp ? 'udp' : 'tcp';
+
+  // 1. Resolve the target into a stream of (host, port) probes.
+  const built = await buildTargets(target, opts, protocol);
+  if (!built) return; // refused (e.g. CIDR too large)
+  const { targets, total } = built;
+
+  // 2. Resume: load prior results and skip the targets already completed.
+  const planId: PlanIdentity = { target, ports: opts.ports, protocol };
+  if (opts.seed !== undefined) planId.seed = opts.seed;
+  let seed: ScanResultRecord[] = [];
+  const done = new Set<string>();
+  if (opts.resume && existsSync(opts.resume)) {
+    const cp = loadCheckpoint(opts.resume);
+    if (!planMatches(cp.plan, planId)) {
+      console.error('resume: checkpoint plan does not match this scan (target/ports/protocol differ)');
+      process.exitCode = 2;
+      return;
+    }
+    seed = cp.report.results;
+    for (const k of doneSet(cp)) done.add(k);
+    console.error(`resuming: ${done.size} target(s) already done, ${total - done.size} to go`);
+  }
+
+  // 3. Checkpoint writer (to --checkpoint, or back to the --resume file).
+  const cpPath = opts.checkpoint ?? opts.resume;
+  const startedAtMs = Date.now();
+  const writer = cpPath ? new CheckpointWriter(cpPath, planId, startedAtMs, seed) : undefined;
+
+  // Flush progress to disk on Ctrl-C so an interrupted scan is resumable.
+  const onSigint = (): void => {
+    writer?.flush();
+    console.error('\ninterrupted; progress saved. exiting.');
+    process.exit(130);
+  };
+  if (writer) process.on('SIGINT', onSigint);
+
+  // 4. Scan the remaining targets, streaming records into progress + checkpoint.
+  const remaining = skipDone(targets, done);
+  const progress = new Progress({ total, force: opts.progress });
+  for (let i = 0; i < done.size; i++) progress.tick(false); // account resumed work in ETA
+  const records: ScanResultRecord[] = [...seed];
+  const openForBanner: TcpProbeResult[] = [];
+
+  if (protocol === 'udp') {
+    for await (const r of scanUdpTargets(remaining, udpOptions(opts))) {
+      const rec = udpRecord(r);
+      records.push(rec);
+      writer?.add(rec);
+      progress.tick(r.state === 'open');
+    }
+  } else {
+    for await (const r of scanTargets(remaining, tcpOptions(opts))) {
+      const rec = tcpRecord(r);
+      records.push(rec);
+      writer?.add(rec);
+      if (r.state === 'open') openForBanner.push(r);
+      progress.tick(r.state === 'open');
+    }
+  }
+  progress.finish();
+
+  // 5. Optional TCP fingerprint phase; merge service/version back into the records.
+  if (protocol === 'tcp' && opts.banner && openForBanner.length > 0) {
+    await mergeFingerprints(records, openForBanner, opts.concurrency);
+  }
+
+  // 6. Build and emit the report.
+  const report = buildReport({ protocol, target, startedAt: startedAtMs, finishedAt: Date.now(), records });
+  writer?.flush();
+  if (writer) process.off('SIGINT', onSigint);
+  emit(report, opts);
+}
+
+interface BuiltTargets {
+  targets: Iterable<Target>;
+  total: number;
+}
+
+async function buildTargets(target: string, opts: Opts, protocol: Protocol): Promise<BuiltTargets | undefined> {
+  if (target.includes('/')) {
+    const cidr = parseCidr(target);
+    if (cidr.size > opts.maxHosts) {
+      console.error(
+        `refusing to scan ${cidr.size} hosts (${target}); raise --max-hosts to proceed. ` +
+          'Only scan networks you own or are authorized to test.',
+      );
+      process.exitCode = 2;
+      return undefined;
+    }
+    console.error(
+      `${protocol.toUpperCase()} scanning ${cidr.size} hosts x ${opts.ports.length} ports. ` +
+        'Only scan networks you own or have written permission to test.',
+    );
     const planOpts: ScanPlanOptions = { randomize: !opts.seq };
     if (opts.seed !== undefined) planOpts.seed = opts.seed;
     const plan = planCidrScan(target, opts.ports, planOpts);
-    for await (const r of scanUdpTargets(plan.targets(), udpOpts)) results.push(r);
-    console.log(`port-sentinel UDP scan of ${target}`);
-  } else {
-    const ip = await resolveHost(target);
-    for await (const r of scanUdpHost(ip, opts.ports, udpOpts)) results.push(r);
-    console.log(`port-sentinel UDP scan of ${target}${ip !== target ? ` (${ip})` : ''}`);
+    return { targets: plan.targets(), total: plan.total };
   }
-  const elapsed = ((performance.now() - started) / 1000).toFixed(2);
-
-  results.sort((a, b) => (a.host === b.host ? a.port - b.port : ipCompare(a.host, b.host)));
-  console.log('PORT      STATE          PROBE  SERVICE  INFO');
-  let open = 0;
-  for (const r of results) {
-    if (r.state === 'open') open++;
-    // "open|filtered" is the common, mostly-uninteresting case; hide it unless --all.
-    if (!opts.all && r.state !== 'open' && r.state !== 'closed') continue;
-    const host = results.some((x) => x.host !== r.host) ? `${r.host} ` : '';
-    console.log(
-      `${host}${`${r.port}/udp`.padEnd(10)}${r.state.padEnd(15)}${r.probe.padEnd(7)}` +
-        `${(r.service ?? '-').padEnd(9)}${r.info ?? ''}`,
-    );
-  }
-  console.log(`\n${results.length} ports in ${elapsed}s: ${open} open (replied)`);
+  const ip = await resolveHost(target);
+  const ports = opts.ports;
+  const targets = (function* () {
+    for (const port of ports) yield { host: ip, port };
+  })();
+  return { targets, total: ports.length };
 }
 
-/**
- * Second phase: fingerprint every open port with bounded concurrency.
- * Runs after the scan so port discovery stays independent of version detection.
- */
-async function runBannerPhase(results: readonly TcpProbeResult[], concurrency: number): Promise<void> {
-  const open: Target[] = results.filter((r) => r.state === 'open').map((r) => ({ host: r.host, port: r.port }));
-  if (open.length === 0) return;
-
-  console.log('\nSERVICE DETECTION');
-  const found: FingerprintResult[] = [];
-  for await (const fp of pool(open, (t) => fingerprint(t.host, t.port), { concurrency: Math.min(concurrency, 50) })) {
-    found.push(fp);
-  }
-  found.sort((a, b) => (a.host === b.host ? a.port - b.port : ipCompare(a.host, b.host)));
-  for (const fp of found) {
-    const svc = fp.match
-      ? `${fp.match.service}${fp.match.soft ? '?' : ''}` +
-        [fp.match.product, fp.match.version, fp.match.info].filter(Boolean).map((x) => ` ${x}`).join('')
-      : 'unknown';
-    const banner = fp.banner.length ? `  "${printableBanner(fp.banner, 80)}"` : '';
-    console.log(`${`${fp.host}:${fp.port}`.padEnd(22)}${svc}${banner}`);
-  }
-}
-
-async function runCidrScan(target: string, opts: Opts, scanOpts: ScanHostOptions): Promise<void> {
-  const cidr = parseCidr(target);
-  if (cidr.size > opts.maxHosts) {
-    console.error(
-      `refusing to scan ${cidr.size} hosts (${target}); raise --max-hosts to proceed. ` +
-        'Only scan networks you own or are authorized to test.',
-    );
-    process.exitCode = 2;
+/** Yield only targets whose host:port is not already in the done-set. */
+function* skipDone(targets: Iterable<Target>, done: Set<string>): Generator<Target> {
+  if (done.size === 0) {
+    yield* targets;
     return;
   }
-  // Ethics guardrail: a CIDR scan touches many machines. Make authorization explicit.
-  console.error(
-    `scanning ${cidr.size} hosts x ${opts.ports.length} ports = ${cidr.size * opts.ports.length} probes. ` +
-      'Only scan networks you own or have written permission to test.',
-  );
+  for (const t of targets) {
+    if (!done.has(`${t.host}:${t.port}`)) yield t;
+  }
+}
 
-  const planOpts: ScanPlanOptions = { randomize: !opts.seq };
-  if (opts.seed !== undefined) planOpts.seed = opts.seed;
-  const plan = planCidrScan(target, opts.ports, planOpts);
+function tcpOptions(opts: Opts): ScanHostOptions {
+  const o: ScanHostOptions = { timeoutMs: opts.timeout, concurrency: opts.concurrency, retries: opts.retries };
+  const limiter = makeLimiter(opts);
+  if (limiter) o.beforeAttempt = () => limiter.take();
+  return o;
+}
 
-  const started = performance.now();
-  const byHost = new Map<string, TcpProbeResult[]>();
+function udpOptions(opts: Opts): ScanUdpOptions {
+  const o: ScanUdpOptions = { timeoutMs: opts.timeout, concurrency: opts.concurrency, retries: opts.retries };
+  const limiter = makeLimiter(opts);
+  if (limiter) o.beforeAttempt = () => limiter.take();
+  return o;
+}
+
+function makeLimiter(opts: Opts): RateLimiter | undefined {
+  if (opts.rate === undefined) return undefined;
+  return new RateLimiter({ ratePerSec: opts.rate, burst: Math.max(1, Math.ceil(opts.rate / 10)) });
+}
+
+async function mergeFingerprints(
+  records: ScanResultRecord[],
+  openPorts: TcpProbeResult[],
+  concurrency: number,
+): Promise<void> {
+  const byKey = new Map(records.map((r) => [`${r.host}:${r.port}`, r]));
+  const targets: Target[] = openPorts.map((r) => ({ host: r.host, port: r.port }));
+  for await (const fp of pool(targets, (t) => fingerprint(t.host, t.port), { concurrency: Math.min(concurrency, 50) })) {
+    if (!fp.match) continue;
+    const rec = byKey.get(`${fp.host}:${fp.port}`);
+    if (!rec) continue;
+    rec.service = fp.match.service;
+    if (fp.match.product !== undefined) rec.product = fp.match.product;
+    if (fp.match.version !== undefined) rec.version = fp.match.version;
+    if (fp.match.info !== undefined) rec.info = fp.match.info;
+  }
+}
+
+// --- output --------------------------------------------------------------------
+
+function emit(report: ScanReport, opts: Opts): void {
+  let text: string;
+  if (opts.output === 'json') text = toJson(report);
+  else if (opts.output === 'grep') text = toGrep(report);
+  else {
+    printTextReport(report, opts.all);
+    return; // the text table goes straight to stdout; nothing to write to a file
+  }
+  if (opts.outFile) {
+    writeFileSync(opts.outFile, text);
+    console.error(`wrote ${report.results.length} results to ${opts.outFile}`);
+  } else {
+    process.stdout.write(text);
+  }
+}
+
+function printTextReport(report: ScanReport, all: boolean | undefined): void {
+  console.log(`port-sentinel ${report.protocol.toUpperCase()} scan of ${report.target}`);
+  const proto = report.protocol;
+  const byHost = new Map<string, ScanResultRecord[]>();
   let open = 0;
-  for await (const r of scanTargets(plan.targets(), scanOpts)) {
+  for (const r of report.results) {
     if (r.state === 'open') open++;
-    if (opts.all || r.state === 'open' || r.state === 'error') {
-      let list = byHost.get(r.host);
-      if (!list) byHost.set(r.host, (list = []));
-      list.push(r);
+    const show = all || r.state === 'open' || (proto === 'udp' && r.state === 'closed');
+    if (!show) continue;
+    let list = byHost.get(r.host);
+    if (!list) byHost.set(r.host, (list = []));
+    list.push(r);
+  }
+  const multi = new Set(report.results.map((r) => r.host)).size > 1;
+  for (const host of byHost.keys()) {
+    if (multi) console.log(`\n${host}`);
+    console.log('PORT      STATE          SERVICE  REASON');
+    for (const r of byHost.get(host)!) {
+      const svc = [r.service ?? r.product, r.version, r.info].filter(Boolean).join(' ') || '-';
+      console.log(`${`${r.port}/${proto}`.padEnd(10)}${r.state.padEnd(15)}${(svc.length > 40 ? `${svc.slice(0, 37)}...` : svc).padEnd(9)}${r.reason}`);
     }
   }
-  const elapsed = ((performance.now() - started) / 1000).toFixed(2);
-
-  for (const host of [...byHost.keys()].sort(ipCompare)) {
-    const results = byHost.get(host)!.sort((a, b) => a.port - b.port);
-    console.log(`\n${host}`);
-    printPortTable(results, true);
-  }
-  console.log(
-    `\n${plan.total} probes across ${plan.hostCount} hosts in ${elapsed}s: ${open} open ports found` +
-      (byHost.size ? ` on ${byHost.size} host(s)` : ''),
-  );
-
-  if (opts.banner) {
-    await runBannerPhase([...byHost.values()].flat(), opts.concurrency);
-  }
+  console.log(`\n${report.results.length} ports in ${(report.elapsedMs / 1000).toFixed(2)}s: ${open} open`);
 }
 
-function printPortTable(results: readonly TcpProbeResult[], all: boolean | undefined): void {
-  console.log('PORT      STATE     REASON        TRIES  LATENCY');
-  for (const r of results) {
-    if (!all && r.state !== 'open') continue;
-    const detail = r.state === 'error' && r.errorCode ? ` (${r.errorCode})` : '';
-    console.log(
-      `${`${r.port}/tcp`.padEnd(10)}${r.state.padEnd(10)}${r.reason.padEnd(14)}` +
-        `${String(r.attempts).padEnd(7)}${r.latencyMs}ms${detail}`,
-    );
+function printDiff(d: ReportDiff): void {
+  if (!d.hasChanges) {
+    console.log('no changes');
+    return;
   }
-}
-
-function printSummary(results: readonly TcpProbeResult[], elapsed: string): void {
-  const counts: Record<PortState, number> = { open: 0, closed: 0, filtered: 0, error: 0 };
-  let attempts = 0;
-  for (const r of results) {
-    counts[r.state]++;
-    attempts += r.attempts;
+  const marks: Record<string, string> = { appeared: '+', disappeared: '-', changed: '~', same: ' ' };
+  for (const c of d.changes) {
+    const svc = c.after?.service ?? c.after?.product ?? c.before?.service ?? '';
+    const tail = c.kind === 'changed' ? ` (${c.detail})` : svc ? ` ${svc}` : '';
+    console.log(`${marks[c.kind]} ${c.host}:${c.port}/${c.protocol} ${c.kind}${tail}`);
   }
-  console.log(
-    `\n${results.length} ports (${attempts} attempts) in ${elapsed}s: ${counts.open} open, ` +
-      `${counts.closed} closed, ${counts.filtered} filtered, ${counts.error} error`,
-  );
+  console.log(`\n${d.counts.appeared} appeared, ${d.counts.disappeared} disappeared, ${d.counts.changed} changed`);
 }
-
-/** Sort dotted-quad strings numerically, not lexically (so .10 comes after .9). */
-function ipCompare(a: string, b: string): number {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 4; i++) {
-    if (pa[i] !== pb[i]) return (pa[i] ?? 0) - (pb[i] ?? 0);
-  }
-  return 0;
-}
-
-await program.parseAsync();

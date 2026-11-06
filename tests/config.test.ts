@@ -62,6 +62,8 @@ describe('scanOptionsSchema', () => {
       udp: false,
       seq: false,
       maxHosts: 4096,
+      output: 'text',
+      progress: false,
     });
     expect(scanOptionsSchema.parse({ ...cli, rate: '250' }).rate).toBe(250);
   });

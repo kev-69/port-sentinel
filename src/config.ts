@@ -55,6 +55,12 @@ export const scanOptionsSchema = z.object({
   seq: z.boolean().default(false), // scan in ascending order instead of shuffled
   seed: z.coerce.number().int().optional(), // permutation seed (reproducible order)
   maxHosts: z.coerce.number().int().min(1).max(16_777_216).default(4096), // blast-radius cap
+  // Output / progress / resume:
+  output: z.enum(['text', 'json', 'grep']).default('text'),
+  outFile: z.string().optional(),
+  progress: z.boolean().default(false),
+  resume: z.string().optional(), // load this checkpoint and skip completed targets
+  checkpoint: z.string().optional(), // periodically save progress here
 });
 
 export type ScanOptions = z.infer<typeof scanOptionsSchema>;
