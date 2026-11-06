@@ -89,3 +89,15 @@ Observations:
   which is the structural reason UDP scans are slow. On Linux the ICMP port-unreachable would return `closed`
   quickly, but Linux rate-limits those to ~1/s, so a wide closed-port UDP scan is slow *there* too, just for a
   different reason. Either way: UDP scanning is inherently slow, and `--retries` makes it slower but more reliable.
+
+## Stage 6: output, resume, diff (2026-11-06)
+
+Not a performance benchmark — a behavior log of the artifacts the stage produces:
+
+- **JSON** report of 127.0.0.1 is a stable `ScanReport` (sorted results, ISO timestamps, `schema: 1`);
+  `--out-file` writes it while progress/notices stay on stderr, so `-o json --out-file x.json` is clean to pipe.
+- **grep** output is `# host\tport\tproto\tstate\tservice\tversion\treason` + one row per port — `grep open`, `cut -f2` friendly.
+- **resume**: scan with `--checkpoint cp.json`, then `--resume cp.json` reported "3 already done, 0 to go" and
+  reconstructed the full report from the checkpoint seed. A mismatched `--ports` was refused (plan guard).
+- **diff**: before (port 48080 closed) vs after (a server bound to 48080) ->
+  `+ 127.0.0.1:48080/tcp appeared`, exit code 1. Identical reports -> "no changes", exit 0.

@@ -118,4 +118,20 @@ Write each stage's section before writing its code.
 
 ## Stage 6: Output formats, progress, resume, diff
 
+**Goal:** make scans produce durable, machine-readable artifacts, survive interruption, show progress, and be comparable over time.
+
+- **Report model** (`output/report.ts`): a `ScanReport` envelope `{ tool, schema, protocol, target, startedAt, finishedAt, elapsedMs, results[] }` where each `ScanResultRecord` is normalized across TCP and UDP: `{ host, port, protocol, state, reason, latencyMs, attempts, service?, product?, version?, info? }`. Results are sorted by (host, port) so the JSON is stable and diffable by line too.
+- **Output formats** (`output/json.ts`, `output/grep.ts`):
+  - **json**: pretty-printed `ScanReport`. The canonical artifact; what `diff` and `--resume` consume.
+  - **grep**: one tab-separated row per result (`host  port  proto  state  service  version  reason`) with a `#`-comment header. Built for `grep`/`awk`/`cut`.
+  - **text**: the existing human table (default), unchanged.
+  - `--output <text|json|grep>` chooses; `--out-file <path>` writes there instead of stdout (progress always goes to stderr, so it never pollutes a redirected report).
+- **Progress** (`output/progress.ts`): a stderr line `done/total (pct) · N open · rate/s · ETA`, throttled to ~10 Hz and redrawn with `\r`. Formatting is a pure function (`formatProgress`) tested without I/O; the writer and clock are injected. Only drawn when stderr is a TTY or `--progress` is forced; silent otherwise.
+- **Resumable scans** (`persistence/checkpoint.ts`):
+  - A checkpoint is a `ScanReport` plus the plan identity (`target`, `ports`, `protocol`, `seed`). Saved atomically (temp file + rename) every `checkpointEveryMs` and on SIGINT.
+  - `--resume <file>`: load it, verify the plan matches the requested scan, build a done-set of `host:port`, and skip already-completed targets. Correctness does **not** depend on scan order — we skip by membership, not by index — so a resumed scan is correct even though the pool completes out of order.
+  - SIGINT flushes the checkpoint and exits non-zero, so Ctrl-C never loses work. (This closes the cancellation non-goal deferred from Stage 2.)
+- **Diff** (`output/diff.ts`): `diffReports(before, after)` over two JSON reports, keyed by `host:port`. Classifies each port as `appeared` (new open), `disappeared` (was open, now not), `changed` (state or service/version differs), or `same`. A `port-sentinel diff a.json b.json` subcommand prints the delta; exit code 1 when there are changes, so it is usable in CI / monitoring. This is the data that feeds project 7 (what changed on the network since last scan).
+- **Non-goals:** XML/Nmap-compatible output, streaming NDJSON, compressing checkpoints, diffing more than two reports.
+
 ## Stage 7: Study: why Nmap SYN scans need raw sockets

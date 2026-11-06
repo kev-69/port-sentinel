@@ -121,3 +121,26 @@ One entry per trade-off: context, options considered, decision, consequences.
 - **Finding (measured 2026-11-05):** a datagram to a closed loopback UDP port produced silence on Windows, connected or not — never `ECONNREFUSED`.
 - **Cause:** libuv's `src/win/udp.c` ignores `WSAECONNRESET`/`WSAENETRESET` on receive ("a previous sendto operation failed; ignore this error") and never sets `SIO_UDP_CONNRESET`. Go, .NET and tokio toggle that ioctl; libuv does not, so the ICMP port-unreachable never reaches JavaScript.
 - **Consequence:** on Windows, every closed UDP port reads `open|filtered`; only Linux reports `closed`. Tests accept either. Documented in SPEC Stage 5 and the UDP test. (Working around it would need a raw socket — the Stage 7 theme.)
+
+## 024: One normalized ScanReport for TCP and UDP
+- **Decision:** both protocols collapse to `ScanResultRecord` inside a `ScanReport` envelope with a `schema` version. TCP fingerprints and UDP probe info land in the same optional `service`/`product`/`version`/`info` fields.
+- **Why:** JSON output, grep output, diff, and checkpoints all consume one shape instead of two. Results are sorted by (host, port) so the JSON is stable and even line-diffable.
+- **Consequence:** adding a field means touching one type and its zod schema; the config exact-match test is the canary that reminds us.
+
+## 025: Resume by done-set membership, not by index
+- **Context:** the pool completes out of order, so "we finished N" says nothing about *which* targets are done.
+- **Decision:** a checkpoint stores every completed record; resume rebuilds a `host:port` done-set and skips targets already in it.
+- **Why:** correctness is independent of scan order, concurrency, and seed. A resumed scan with a different `--seed` or `--concurrency` still covers exactly the missing targets.
+- **Consequence:** the checkpoint grows with results (fine — it *is* the report). Huge scans would want a compact form; noted as a non-goal.
+
+## 026: Atomic checkpoint writes (temp + rename)
+- **Decision:** `saveCheckpoint` writes `path.tmp` then `renameSync` over `path`.
+- **Why:** rename is atomic on one filesystem, so a crash (or Ctrl-C) mid-write can never corrupt the last good checkpoint. A direct overwrite could leave a truncated file that fails to parse on resume — the one moment you need it most.
+
+## 027: SIGINT flushes and exits 130
+- **Decision:** when a checkpoint is active, a SIGINT handler flushes the writer and exits 130 (128 + SIGINT). The handler is removed on normal completion.
+- **Why:** closes the cancellation non-goal deferred from Stage 2. Ctrl-C on a long scan now saves progress instead of losing it. Exit 130 is the conventional "killed by SIGINT" code.
+
+## 028: diff keys on host:port, groups open and open|filtered as "openish"
+- **Decision:** `diffReports` compares by `host:port/proto`. `appeared`/`disappeared` are judged on an "openish" predicate (`open` or `open|filtered`), so a UDP port flipping between those is not noise, while open↔closed is. `diff` exits 1 on any change.
+- **Why:** the security-relevant signal is "a service started/stopped listening", not latency jitter. Exit 1 makes `diff` a CI/monitoring gate (feeds project 7).
