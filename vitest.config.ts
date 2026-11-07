@@ -6,5 +6,10 @@ export default defineConfig({
     environment: 'node',
     // Network tests open real sockets on loopback; keep them from hanging CI.
     testTimeout: 10_000,
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      reporter: ['text', 'json-summary'],
+    },
   },
 });
